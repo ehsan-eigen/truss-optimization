@@ -102,6 +102,70 @@ def gradient(def_members, lengths, E):
     # so dJ/dA_e = −(E/L_e)(b_e^T u_e)^2 = −E · L_e · strain_e^2.
     return -E * lengths * def_members**2
 
+
+# ---------------------------------------------------------------------------
+# General adjoint machinery — use these for non-self-adjoint objectives
+# (peak stress, nodal displacement, eigenvalues, buckling, etc.).
+# For compliance with fixed loads, prefer the `gradient()` shortcut above.
+# ---------------------------------------------------------------------------
+
+def calculate_del_Kg__del_area(theta, mag, E, A):
+    c = math.cos(theta)
+    s = math.sin(theta)
+
+    K11 = (E/mag)*np.array([[c**2,c*s],[c*s,s**2]])
+    K12 = (E/mag)*np.array([[-c**2,-c*s],[-c*s,-s**2]])
+    K21 = (E/mag)*np.array([[-c**2,-c*s],[-c*s,-s**2]])
+    K22 = (E/mag)*np.array([[c**2,c*s],[c*s,s**2]])
+
+    return [K11, K12, K21, K22]
+
+
+def build_del_K__del_area(members, members_area, orientations, lengths, E):
+    n_DOF = calc_DOF(members)
+    Kp = np.zeros([n_DOF, n_DOF])
+    d_Kp__d_area = np.zeros((n_DOF, n_DOF, len(members)))
+    for dimension in range(len(members)):
+        for n, mbr in enumerate(members):
+            theta = orientations[n]
+            L = lengths[n]
+            A = members_area[n]
+            if n == dimension:
+                [K11, K12, K21, K22] = calculate_del_Kg__del_area(theta, L, E, A)
+            else:
+                continue
+
+            node_i = mbr[0]
+            node_j = mbr[1]
+            i = 2 * node_i
+            j = 2 * node_j
+
+            d_Kp__d_area[i:i+2, i:i+2, dimension] = Kp[i:i+2, i:i+2] + K11
+            d_Kp__d_area[j:j+2, j:j+2, dimension] = Kp[j:j+2, j:j+2] + K22
+            d_Kp__d_area[i:i+2, j:j+2, dimension] = Kp[i:i+2, j:j+2] + K12
+            d_Kp__d_area[j:j+2, i:i+2, dimension] = Kp[j:j+2, i:i+2] + K21
+
+    return d_Kp__d_area
+
+
+def gradient_general(K, dJ_dU, U, del_K__del_area, lengths, restrained_DOF):
+    # Full adjoint sensitivity for an arbitrary objective J(U, A).
+    # Caller supplies ∂J/∂U (vector over all DOF). Solves K^T λ = ∂J/∂U,
+    # then dJ/dA_e = ∂J/∂A_e − λ^T (∂K/∂A_e) U  (the explicit ∂J/∂A_e term
+    # must be added by the caller if it is nonzero).
+    K_reduced = build_matrix_reduced(K, restrained_DOF)
+    dKdA_reduced = build_matrix_reduced(del_K__del_area, restrained_DOF)
+    dJdU_reduced = build_matrix_reduced(dJ_dU, restrained_DOF)
+    U_reduced = build_matrix_reduced(U, restrained_DOF)
+
+    lambda_ = np.linalg.solve(K_reduced.T, dJdU_reduced)
+
+    temp = np.zeros((len(U_reduced), len(lengths)))
+    for i in range(len(lengths)):
+        temp[:, i] = dKdA_reduced[:, :, i] @ U_reduced
+
+    return -lambda_.T @ temp
+
 env = StructEnvironment()
 cost = []
 
