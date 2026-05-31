@@ -65,39 +65,45 @@ def calc_rotation_length(members, nodes):
         lengths = np.append(lengths, length)
     return rotations, lengths
     
-def plot_deflection(members,nodes,mbrForces,members_area,UG,xFac,turn,output_dir='images'):
+def plot_deflection(members, nodes, mbrForces, members_area, UG, xFac, turn,
+                    output_dir='images', compliance=None, volume=None, algo=None):
 
     members_area = members_area * 100
-  
-    
-    #FIGURE TO PLOT DEFLECTED SHAPE
-    fig = plt.figure(figsize=(3,3),dpi=80) 
-    axes = fig.add_axes([0.1,0.1,2,2]) 
+
+    fig = plt.figure(figsize=(4, 4), dpi=100)
+    axes = fig.add_axes([0.1, 0.1, 2, 2])
     fig.gca().set_aspect('equal', adjustable='box')
 
-    #Plot members
+    for index, member in enumerate(members):
+        node_s = nodes[member[0]]
+        node_e = nodes[member[1]]
+        i = 2 * member[0]
+        j = 2 * member[1]
 
-    for index,member in enumerate(members):  
-        
-        node_s = nodes[member[0]]  # Node number for node i of this member
-        node_e = nodes[member[1]]  # Node number for node j of this member
-
-        #Index of DoF for this member
-        i = 2*member[0] #horizontal DoF at node i of this member 
-        j = 2*member[1] #horizontal DoF at node j of this member
-
-        if mbrForces[index]>0:
+        if mbrForces[index] > 0:
             color = 'r'
         else:
             color = 'b'
 
-        if members_area[index] > 1e-3:
-            axes.plot([node_s[0] + UG[i]*xFac, node_e[0] + UG[j]*xFac], [node_s[1] + UG[i+1]*xFac, node_e[1] + UG[j+1]*xFac],color,lw=members_area[index])
+        if members_area[index] > 1e-5:
+            axes.plot(
+                [node_s[0] + UG[i]*xFac,   node_e[0] + UG[j]*xFac],
+                [node_s[1] + UG[i+1]*xFac, node_e[1] + UG[j+1]*xFac],
+                color, lw=members_area[index],
+            )
 
     axes.set_xlabel('Distance (m)')
     axes.set_ylabel('Distance (m)')
-    axes.set_title('Deflected shape')
     axes.grid()
+
+    prefix = f'{algo} — ' if algo else ''
+    title = f'{prefix}Iteration {turn}'
+    if compliance is not None:
+        title += f'\nCompliance: {compliance:.4f}'
+    if volume is not None:
+        title += f'   Volume: {volume:.4f}'
+    axes.set_title(title, fontsize=9)
+
     os.makedirs(output_dir, exist_ok=True)
     plt.savefig(f'{output_dir}/structure_{turn:03d}.png', bbox_inches='tight')
     plt.close(fig)

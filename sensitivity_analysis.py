@@ -8,7 +8,7 @@ import glob
 import os
 import numpy as np
 from matplotlib import pyplot as plt
-from PIL import Image
+import imageio.v3 as iio
 import pandas as pd
 import math
 from utils import *
@@ -17,16 +17,20 @@ OUTPUT_DIR = 'results'
 
 
 def build_gif(frame_dir, gif_path, pattern='structure_*.png',
-              duration_ms=120, hold_last_ms=1500):
+              fps=3, hold_last_s=5.0):
+    from PIL import Image as PilImage
     frames = sorted(glob.glob(os.path.join(frame_dir, pattern)))
     if not frames:
         print(f"[gif] no frames matching {pattern} in {frame_dir}")
         return
-    images = [Image.open(f).convert('P', palette=Image.ADAPTIVE) for f in frames]
-    durations = [duration_ms] * (len(images) - 1) + [hold_last_ms]
-    images[0].save(gif_path, save_all=True, append_images=images[1:],
-                   duration=durations, loop=0, optimize=True, disposal=2)
-    print(f"[gif] wrote {gif_path}  ({len(images)} frames)")
+    pil_imgs = [PilImage.open(f).convert('RGBA') for f in frames]
+    target = pil_imgs[0].size  # (w, h) of first frame
+    pil_imgs = [im.resize(target, PilImage.LANCZOS) for im in pil_imgs]
+    hold_copies = max(1, int(hold_last_s * fps))
+    pil_imgs = pil_imgs + [pil_imgs[-1]] * (hold_copies - 1)
+    images = [np.array(im) for im in pil_imgs]
+    iio.imwrite(gif_path, images, plugin='pillow', duration=1000 // fps, loop=0)
+    print(f"[gif] wrote {gif_path}  ({len(frames)} frames @ {fps} fps)")
 DEFAULT_DATASET = 'initial_structure'
 xFac = 1
 
@@ -106,8 +110,11 @@ class StructEnvironment():
         cost = self.calculate_cost(def_members)
         return cost,F_members,UG
 
-    def render(self,members_area,F_members,UG,output_dir=OUTPUT_DIR):
-        plot_deflection(self.members, self.nodes,F_members, members_area,UG ,xFac,self.current_step,output_dir=output_dir)
+    def render(self, members_area, F_members, UG, output_dir=OUTPUT_DIR,
+               compliance=None, volume=None, algo=None):
+        plot_deflection(self.members, self.nodes, F_members, members_area, UG,
+                        xFac, self.current_step, output_dir=output_dir,
+                        compliance=compliance, volume=volume, algo=algo)
 
 """# Adjoint Method ( Sensivity Analysis )
 
@@ -353,7 +360,8 @@ def run_oc(env, members_area, max_iter=150, change_tol_factor=1e-3,
         F_members, def_members, UG, K = env.analyse(members_area)
         compliance_hist.append(env.calculate_cost(UG))
         volume_hist.append(float(np.sum(members_area * env.lengths)))
-        env.render(members_area, F_members, UG, output_dir=output_dir)
+        env.render(members_area, F_members, UG, output_dir=output_dir,
+                   compliance=compliance_hist[-1], volume=volume_hist[-1], algo='OC')
 
         dJ_dA = gradient(def_members, env.lengths, env.E)
         A_new = oc_update(members_area, dJ_dA, env.lengths, V_target)
@@ -385,7 +393,8 @@ def run_mma(env, members_area, C_max, max_iter=200, change_tol_factor=1e-3,
         compliance = env.calculate_cost(UG)
         compliance_hist.append(compliance)
         volume_hist.append(float(np.sum(members_area * env.lengths)))
-        env.render(members_area, F_members, UG, output_dir=output_dir)
+        env.render(members_area, F_members, UG, output_dir=output_dir,
+                   compliance=compliance, volume=volume_hist[-1], algo='MMA')
 
         dC_dA = gradient(def_members, env.lengths, env.E)
 
