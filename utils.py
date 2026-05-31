@@ -1,3 +1,4 @@
+import os
 import numpy as np
 from matplotlib import pyplot as plt
 import pandas as pd
@@ -64,7 +65,7 @@ def calc_rotation_length(members, nodes):
         lengths = np.append(lengths, length)
     return rotations, lengths
     
-def plot_deflection(members,nodes,mbrForces,members_area,UG,xFac,turn):
+def plot_deflection(members,nodes,mbrForces,members_area,UG,xFac,turn,output_dir='images'):
 
     members_area = members_area * 500
   
@@ -98,7 +99,9 @@ def plot_deflection(members,nodes,mbrForces,members_area,UG,xFac,turn):
     axes.set_ylabel('Distance (m)')
     axes.set_title('Deflected shape')
     axes.grid()
-    plt.savefig(f'images/{turn}.png',bbox_inches='tight')
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(f'{output_dir}/structure_{turn:03d}.png', bbox_inches='tight')
+    plt.close(fig)
     
 def calc_member_forces_def(member,A,theta,L,U,E):
     
