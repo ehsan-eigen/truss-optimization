@@ -181,6 +181,126 @@ def gradient_general(K, dJ_dU, U, del_K__del_area, lengths, restrained_DOF):
     return -lambda_.T @ temp
 
 
+class MMAWeightMin:
+    # Simplified Method of Moving Asymptotes (Svanberg 1987) for
+    #   minimize    Σ A_e L_e                (structural weight ∝ volume)
+    #   subject to  compliance(A) ≤ C_max
+    #               A_min ≤ A_e ≤ A_max
+    #
+    # With a single global inequality constraint, the MMA subproblem reduces
+    # to a 1-D dual (one Lagrange multiplier λ ≥ 0) and is solved by bisection
+    # in each outer iteration — no QP solver needed. Asymptotes L_e, U_e are
+    # adapted based on the sign of the recent move history.
+    #
+    # Use this solver for weight reduction. For fixed-volume compliance
+    # minimization, use `oc_update()` instead.
+
+    def __init__(self, A0, A_min=1e-4, A_max=None, move=0.2,
+                 asy_init=0.5, asy_decr=0.7, asy_incr=1.2,
+                 asy_floor_frac=0.1, asy_ceil_frac=10.0):
+        # `asy_floor_frac` / `asy_ceil_frac` keep asymptotes within an order
+        # of magnitude of A (essential when design variables are positive
+        # quantities spanning several orders of magnitude — e.g. truss areas).
+        self.A_min = A_min
+        self.A_max = A_max if A_max is not None else 100.0 * A0.max()
+        self.move = move
+        self.asy_init = asy_init
+        self.asy_decr = asy_decr
+        self.asy_incr = asy_incr
+        self.asy_floor_frac = asy_floor_frac
+        self.asy_ceil_frac = asy_ceil_frac
+        self.A_prev = A0.copy()
+        self.A_prev2 = A0.copy()
+        self.L = None
+        self.U = None
+        self.k = 0
+
+    def _update_asymptotes(self, A):
+        rng = self.A_max - self.A_min
+        if self.k < 2:
+            self.L = A - self.asy_init * rng
+            self.U = A + self.asy_init * rng
+        else:
+            sgn = (A - self.A_prev) * (self.A_prev - self.A_prev2)
+            gamma = np.where(sgn < 0, self.asy_decr,
+                     np.where(sgn > 0, self.asy_incr, 1.0))
+            self.L = A - gamma * (self.A_prev - self.L)
+            self.U = A + gamma * (self.U - self.A_prev)
+        # Cap asymptote distance relative to A (positivity / scale safety) and
+        # also relative to the total range (Svanberg's standard caps).
+        self.L = np.maximum(self.L, self.asy_floor_frac * A)
+        self.L = np.minimum(self.L, A - 0.01 * rng)
+        self.L = np.maximum(self.L, A - 10.0 * rng)
+        self.U = np.minimum(self.U, self.asy_ceil_frac * A)
+        self.U = np.maximum(self.U, A + 0.01 * rng)
+        self.U = np.minimum(self.U, A + 10.0 * rng)
+
+    def step(self, A, lengths, compliance, dC_dA, C_max, _update_asy=True):
+        # Returns A_new minimizing the MMA approximation of the volume
+        # objective subject to the MMA approximation of compliance ≤ C_max.
+        # Pass _update_asy=False to reuse the current L/U (used by GCMMA
+        # backtracking, which contracts L/U externally between retries).
+        if _update_asy:
+            self._update_asymptotes(A)
+        L, U = self.L, self.U
+        rng = self.A_max - self.A_min
+
+        # Move-limited box for the subproblem (inside the asymptote interval).
+        alpha = np.maximum.reduce([np.full_like(A, self.A_min),
+                                   L + 0.1 * (A - L),
+                                   A - self.move * rng])
+        beta  = np.minimum.reduce([np.full_like(A, self.A_max),
+                                   U - 0.1 * (U - A),
+                                   A + self.move * rng])
+
+        # MMA coefficients. Objective grad = lengths (>0) → only p0 is nonzero.
+        # Constraint grad dC/dA ≤ 0 (more material → less compliance) → only q1 is nonzero.
+        g0 = lengths
+        g1 = dC_dA
+        p0 = (U - A)**2 * np.maximum(g0, 0.0)
+        q0 = (A - L)**2 * np.maximum(-g0, 0.0)
+        p1 = (U - A)**2 * np.maximum(g1, 0.0)
+        q1 = (A - L)**2 * np.maximum(-g1, 0.0)
+
+        # Constraint approx:  C(A) ≈ C_k + Σ[p1/(U-A) + q1/(A-L)] − Σ[p1/(U-A_k) + q1/(A_k-L_k)]
+        # Require ≤ C_max ⇒ Σ[p1/(U-A) + q1/(A-L)] ≤ rhs
+        rhs = C_max - compliance + np.sum(p1 / (U - A) + q1 / (A - L))
+
+        def primal(lam):
+            # Stationarity: p0/(U-A)^2 + lam·p1/(U-A)^2 = q0/(A-L)^2 + lam·q1/(A-L)^2
+            num_top = p0 + lam * p1
+            num_bot = q0 + lam * q1
+            r = np.sqrt(np.maximum(num_bot, 1e-30) / np.maximum(num_top, 1e-30))
+            # (A-L)/(U-A) = r ⇒ A = (L + r·U) / (1 + r)
+            A_star = (L + r * U) / (1.0 + r)
+            return np.clip(A_star, alpha, beta)
+
+        def constraint_residual(lam):
+            A_l = primal(lam)
+            return np.sum(p1 / (U - A_l) + q1 / (A_l - L)) - rhs
+
+        # Bisect λ ≥ 0. As λ↑, A↑, LHS↓ (monotone), so this is well-behaved.
+        if constraint_residual(0.0) <= 0:
+            A_new = primal(0.0)                      # constraint inactive
+        else:
+            lo, hi = 0.0, 1.0
+            while constraint_residual(hi) > 0 and hi < 1e20:
+                hi *= 10.0
+            for _ in range(60):
+                mid = 0.5 * (lo + hi)
+                if constraint_residual(mid) > 0:
+                    lo = mid
+                else:
+                    hi = mid
+            A_new = primal(0.5 * (lo + hi))
+
+        if _update_asy:
+            self.A_prev2 = self.A_prev
+            self.A_prev = A.copy()
+            self.k += 1
+        return A_new
+
+
 def oc_update(A, dJ_dA, lengths, V_target,
               A_min=1e-4, A_max=None, move=0.2, eta=0.5,
               mu_lo=1e-12, mu_hi=1e12, tol=1e-6):
@@ -209,46 +329,133 @@ def oc_update(A, dJ_dA, lengths, V_target,
     return A_new
 
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+def run_oc(env, members_area, max_iter=150, change_tol_factor=1e-3):
+    V_target = env.total_area
+    change_tol = change_tol_factor * env.A
+    compliance_hist, volume_hist = [], []
+    for i in range(max_iter):
+        F_members, def_members, UG, K = env.analyse(members_area)
+        compliance_hist.append(env.calculate_cost(UG))
+        volume_hist.append(float(np.sum(members_area * env.lengths)))
+        env.render(members_area, F_members, UG)
 
-import sys
-dataset = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DATASET
-env = StructEnvironment(dataset=dataset)
-cost = []
-members_area = np.ones(env.element_count) * env.A
-V_target = env.total_area
+        dJ_dA = gradient(def_members, env.lengths, env.E)
+        A_new = oc_update(members_area, dJ_dA, env.lengths, V_target)
 
-max_iter = 150
-change_tol = 1e-3 * env.A
+        change = np.abs(A_new - members_area).max()
+        print(f"[OC]  iter {i:3d}  compliance {compliance_hist[-1]:.4f}  "
+              f"vol {volume_hist[-1]:.4f}  ΔA {change:.3e}")
+        members_area = A_new
+        env.current_step += 1
+        if change < change_tol:
+            print(f"[OC]  converged at iteration {i}")
+            break
+    return members_area, np.array(compliance_hist), np.array(volume_hist)
 
-for i in range(max_iter):
-    F_members, def_members, UG, K = env.analyse(members_area)
-    new_cost = env.calculate_cost(UG)
-    cost.append(new_cost)
 
-    env.render(members_area, F_members, UG)
-    dJ_dA = gradient(def_members, env.lengths, env.E)
-    A_new = oc_update(members_area, dJ_dA, env.lengths, V_target)
+def run_mma(env, members_area, C_max, max_iter=200, change_tol_factor=1e-3,
+            A_min=1e-4, A_max=None, overshoot_factor=1.01, max_inner=15):
+    # Outer loop = MMA iteration; inner loop = GCMMA-style backtracking. If
+    # the trial step makes the true compliance exceed C_max * overshoot_factor,
+    # we reject it, contract the asymptotes toward A_k, and re-solve. This
+    # safeguards against MMA's linear approximation underestimating compliance
+    # growth (compliance ~ 1/A is highly nonlinear).
+    solver = MMAWeightMin(members_area, A_min=A_min, A_max=A_max)
+    change_tol = change_tol_factor * env.A
+    compliance_hist, volume_hist = [], []
+    for i in range(max_iter):
+        F_members, def_members, UG, K = env.analyse(members_area)
+        compliance = env.calculate_cost(UG)
+        compliance_hist.append(compliance)
+        volume_hist.append(float(np.sum(members_area * env.lengths)))
+        env.render(members_area, F_members, UG)
 
-    change = np.abs(A_new - members_area).max()
-    print(f"iteration: {i} , cost: {new_cost:.4f} , max ΔA: {change:.3e}")
-    members_area = A_new
-    env.current_step += 1
+        dC_dA = gradient(def_members, env.lengths, env.E)
 
-    if change < change_tol:
-        print(f"converged at iteration {i}")
-        break
+        # GCMMA-style inner loop: try a step, if it overshoots C_max badly,
+        # contract asymptotes and try again.
+        A_new = solver.step(members_area, env.lengths, compliance, dC_dA, C_max)
+        for inner in range(max_inner):
+            F_t, d_t, UG_t, _ = env.analyse(A_new)
+            C_trial = env.calculate_cost(UG_t)
+            if C_trial <= C_max * overshoot_factor:
+                break
+            # Pull asymptotes inward toward A_k (Svanberg's GCMMA "rho" idea
+            # simplified): shrink the (U-L) interval by half each retry.
+            solver.L = members_area - 0.5 * (members_area - solver.L)
+            solver.U = members_area + 0.5 * (solver.U - members_area)
+            A_new = solver.step(members_area, env.lengths, compliance, dC_dA,
+                                C_max, _update_asy=False)
 
-cost = np.array(cost)
+        change = np.abs(A_new - members_area).max()
+        feas = "feas" if compliance <= C_max else "INFEAS"
+        print(f"[MMA] iter {i:3d}  vol {volume_hist[-1]:.4f}  "
+              f"compliance {compliance:.4f} (≤ {C_max:.4f}, {feas})  ΔA {change:.3e}"
+              + (f"  inner {inner}" if inner else ""))
+        members_area = A_new
+        env.current_step += 1
+        if change < change_tol and compliance <= C_max:
+            print(f"[MMA] converged at iteration {i}")
+            break
+    return members_area, np.array(compliance_hist), np.array(volume_hist)
 
-fig = plt.figure(figsize=(6,4), dpi=100)
-axes = fig.add_subplot(1, 1, 1)
-axes.plot(cost, marker='o', markersize=3)
-axes.set_xlabel('iteration')
-axes.set_ylabel('compliance (F·U)')
-axes.set_title('OC convergence — global compliance vs iteration')
-axes.grid(True, alpha=0.3)
-fig.tight_layout()
-fig.savefig(f'{OUTPUT_DIR}/cost_vs_iteration.png', bbox_inches='tight')
-plt.close(fig)
-print(f"saved cost curve + {len(cost)} structure frames to '{OUTPUT_DIR}/'")
+
+def plot_history(compliance_hist, volume_hist, algo, out_path, C_max=None):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4), dpi=100)
+    ax1.plot(compliance_hist, marker='o', markersize=3)
+    if C_max is not None:
+        ax1.axhline(C_max, color='r', linestyle='--', label=f'C_max = {C_max:.3f}')
+        ax1.legend()
+    ax1.set_xlabel('iteration'); ax1.set_ylabel('compliance (F·U)')
+    ax1.set_title(f'{algo}: compliance'); ax1.grid(True, alpha=0.3)
+
+    ax2.plot(volume_hist, marker='o', markersize=3, color='C1')
+    ax2.set_xlabel('iteration'); ax2.set_ylabel('volume Σ A·L')
+    ax2.set_title(f'{algo}: volume'); ax2.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(out_path, bbox_inches='tight')
+    plt.close(fig)
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', default=DEFAULT_DATASET)
+    parser.add_argument('--algo', choices=['oc', 'mma'], default='oc',
+                        help='oc: compliance-min @ fixed volume; '
+                             'mma: weight-min subject to compliance ≤ C_max')
+    parser.add_argument('--max-iter', type=int, default=200)
+    parser.add_argument('--c-max', type=float, default=None,
+                        help='MMA only: absolute compliance bound')
+    parser.add_argument('--c-max-factor', type=float, default=1.5,
+                        help='MMA only: bound = factor × initial compliance '
+                             '(used when --c-max not given)')
+    args = parser.parse_args()
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    env = StructEnvironment(dataset=args.dataset)
+    members_area = np.ones(env.element_count) * env.A
+
+    if args.algo == 'oc':
+        members_area, comp_hist, vol_hist = run_oc(env, members_area,
+                                                   max_iter=args.max_iter)
+        plot_history(comp_hist, vol_hist, 'OC',
+                     f'{OUTPUT_DIR}/cost_vs_iteration.png')
+    else:
+        if args.c_max is None:
+            F0, d0, UG0, _ = env.analyse(members_area)
+            C0 = env.calculate_cost(UG0)
+            C_max = args.c_max_factor * C0
+            print(f"[MMA] initial compliance = {C0:.4f}, "
+                  f"using C_max = {args.c_max_factor} × C0 = {C_max:.4f}")
+        else:
+            C_max = args.c_max
+        members_area, comp_hist, vol_hist = run_mma(env, members_area, C_max,
+                                                    max_iter=args.max_iter)
+        plot_history(comp_hist, vol_hist, 'MMA',
+                     f'{OUTPUT_DIR}/cost_vs_iteration.png', C_max=C_max)
+
+    print(f"final volume:     {np.sum(members_area * env.lengths):.6f}")
+    print(f"final compliance: {comp_hist[-1]:.6f}")
+    print(f"active elements:  {int(np.sum(members_area > 2e-4))}/{env.element_count}")
+    print(f"saved cost curve + {len(comp_hist)} structure frames to '{OUTPUT_DIR}/'")
