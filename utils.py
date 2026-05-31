@@ -86,14 +86,13 @@ def plot_deflection(members,nodes,mbrForces,members_area,UG,xFac,turn,output_dir
         i = 2*member[0] #horizontal DoF at node i of this member 
         j = 2*member[1] #horizontal DoF at node j of this member
 
-        axes.plot([node_s[0],node_e[0]],[node_s[1],node_e[1]],'grey', lw=0.75) #Member
         if mbrForces[index]>0:
             color = 'r'
         else:
             color = 'b'
 
         if members_area[index] > 1e-3:
-            axes.plot([node_s[0] + UG[i]*xFac, node_e[0] + UG[j]*xFac], [node_s[1] + UG[i+1]*xFac, node_e[1] + UG[j+1]*xFac],color,lw=members_area[index]) #Deformed member
+            axes.plot([node_s[0] + UG[i]*xFac, node_e[0] + UG[j]*xFac], [node_s[1] + UG[i+1]*xFac, node_e[1] + UG[j+1]*xFac],color,lw=members_area[index])
 
     axes.set_xlabel('Distance (m)')
     axes.set_ylabel('Distance (m)')
