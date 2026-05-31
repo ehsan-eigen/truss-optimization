@@ -152,7 +152,10 @@ def gradient_general(K, dJ_dU, U, del_K__del_area, lengths, restrained_DOF):
     # Full adjoint sensitivity for an arbitrary objective J(U, A).
     # Caller supplies ∂J/∂U (vector over all DOF). Solves K^T λ = ∂J/∂U,
     # then dJ/dA_e = ∂J/∂A_e − λ^T (∂K/∂A_e) U  (the explicit ∂J/∂A_e term
-    # must be added by the caller if it is nonzero).
+    # must be added by the caller if it is nonzero). in other words, 
+    # it returns only the −λ^T (∂K/∂A_e) U term. 
+    # If your future J has explicit dependence on A (e.g., a volume penalty, or a stress
+    # formula that divides by A), you'll need to add ∂J/∂A_e at the call site.
     K_reduced = build_matrix_reduced(K, restrained_DOF)
     dKdA_reduced = build_matrix_reduced(del_K__del_area, restrained_DOF)
     dJdU_reduced = build_matrix_reduced(dJ_dU, restrained_DOF)
