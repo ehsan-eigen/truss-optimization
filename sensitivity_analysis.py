@@ -169,36 +169,60 @@ def gradient_general(K, dJ_dU, U, del_K__del_area, lengths, restrained_DOF):
 
     return -lambda_.T @ temp
 
+
+def oc_update(A, dJ_dA, lengths, V_target,
+              A_min=1e-4, A_max=None, move=0.2, eta=0.5,
+              mu_lo=1e-12, mu_hi=1e12, tol=1e-6):
+    # Optimality-Criteria update for compliance minimization under a fixed
+    # volume constraint Σ A_e L_e = V_target.
+    #
+    # Update rule:  A_new = clip( A · (−dJ/dA / (μ L))^η,
+    #                             max(A_min, A(1−move)),
+    #                             min(A_max, A(1+move)) )
+    # μ is found by bisection so the volume constraint is met. For compliance
+    # dJ/dA ≤ 0 so −dJ/dA ≥ 0 and the root inside the parentheses is real.
+    if A_max is None:
+        A_max = 100.0 * A.max()
+    neg_dJ = np.maximum(-dJ_dA, 0.0)
+    lo, hi = mu_lo, mu_hi
+    while (hi - lo) / (hi + lo) > tol:
+        mu = 0.5 * (lo + hi)
+        B_eta = (neg_dJ / (mu * lengths + 1e-30)) ** eta
+        A_trial = A * B_eta
+        A_new = np.minimum(A_trial, np.minimum(A_max, A * (1.0 + move)))
+        A_new = np.maximum(A_new,   np.maximum(A_min, A * (1.0 - move)))
+        if np.sum(A_new * lengths) - V_target > 0:
+            lo = mu  # too much volume → tighten penalty
+        else:
+            hi = mu
+    return A_new
+
+
 env = StructEnvironment()
 cost = []
+members_area = np.ones(env.element_count) * env.A
+V_target = env.total_area
 
-members_area = env.reset()
-members_area = np.ones_like(members_area) * env.A
+max_iter = 150
+change_tol = 1e-3 * env.A
 
-removed_indices = []
-i = 0
-while True:
-    F_members,def_members,UG,K = env.analyse(members_area)
+for i in range(max_iter):
+    F_members, def_members, UG, K = env.analyse(members_area)
     new_cost = env.calculate_cost(UG)
-    if (len(cost)>0) and (new_cost > 5*cost[i-1]):
-        break
     cost.append(new_cost)
 
-    env.render(members_area,F_members,UG)
-    gradient_area = gradient(def_members, env.lengths, env.E)
-    edges_sorted_by_importance = np.argsort(gradient_area)[::-1]
-    j = 0
-    while True:
-        if edges_sorted_by_importance[j] not in removed_indices:
-            removed_indices.append(edges_sorted_by_importance[j])
-            break
-        j +=1
+    env.render(members_area, F_members, UG)
+    dJ_dA = gradient(def_members, env.lengths, env.E)
+    A_new = oc_update(members_area, dJ_dA, env.lengths, V_target)
 
-    print(f"iteration: {i} , cost: {cost[i]}") # cost is the same as compliance : F.T @ U
-    members_area[np.array(removed_indices)] = 1e-4 # set size of the removed elements very close to 0
-    members_area = env.redistribute_material(members_area) # redistribute the material among the elements which are not removed
-    env.current_step +=1
-    i += 1
+    change = np.abs(A_new - members_area).max()
+    print(f"iteration: {i} , cost: {new_cost:.4f} , max ΔA: {change:.3e}")
+    members_area = A_new
+    env.current_step += 1
+
+    if change < change_tol:
+        print(f"converged at iteration {i}")
+        break
 
 cost = np.array(cost)
 
