@@ -41,7 +41,6 @@ class StructEnvironment():
 
     def analyse(self,members_area):
         K = build_K(self.members, members_area, self.rotations, self.lengths, self.E)
-        del_K__del_area = build_del_K__del_area(self.members, members_area, self.rotations, self.lengths, self.E)
         U_free = calc_displacement(K, self.point_loads, self.restrained_DOF)
         UG = assemble_UG(U_free, self.DOF, self.restrained_DOF)
         U_2d = UG.reshape((-1,2))
@@ -53,7 +52,7 @@ class StructEnvironment():
             F_member,def_member =  calc_member_forces_def(self.members[i],members_area[i],self.rotations[i],L,U_2d,self.E)
             def_members[i] = def_member/L
             F_members[i] = F_member
-        return F_members,def_members,UG,del_K__del_area,K
+        return F_members,def_members,UG,K
 
     def calculate_cost(self,UG): # global compliance
         return UG@self.point_loads
@@ -77,73 +76,31 @@ class StructEnvironment():
         return members_area
 
     def step(self, members_area):
-        F_members,def_members,UG,del_K__del_area = self.analyse(members_area)
+        F_members,def_members,UG,K = self.analyse(members_area)
         cost = self.calculate_cost(def_members)
         return cost,F_members,UG
 
     def render(self,members_area,F_members,UG):
         plot_deflection(self.members, self.nodes,F_members, members_area,UG ,2,self.current_step)
 
-"""# Adjoint Method ( Sensivity Analysis )"""
+"""# Adjoint Method ( Sensivity Analysis )
 
-def calculate_del_Kg__del_area(theta,mag,E,A):
+Compliance J = F^T U is a SELF-ADJOINT problem: K is symmetric, dJ/dU = F,
+so the adjoint equation K^T λ = F yields λ = U. The full adjoint sensitivity
+formula −λ^T (dK/dA_e) U then collapses to a per-element closed form
+involving only the local axial strain — no global dK/dA tensor and no second
+linear solve are needed.
 
-    c = math.cos(theta)
-    s = math.sin(theta)
+For ANY OTHER objective (peak stress, displacement at a node, eigenvalue,
+buckling load, etc.) this shortcut does NOT apply: you must solve the
+adjoint system K^T λ = ∂J/∂U and form −λ^T (dK/dA_e) U explicitly.
+"""
 
-    K11 = (E/mag)*np.array([[c**2,c*s],[c*s,s**2]]) #Top left quadrant of del_Kg__del_area
-    K12 = (E/mag)*np.array([[-c**2,-c*s],[-c*s,-s**2]]) #Top right quadrant of del_Kg__del_area
-    K21 = (E/mag)*np.array([[-c**2,-c*s],[-c*s,-s**2]]) #Bottom left quadrant of del_Kg__del_area
-    K22 = (E/mag)*np.array([[c**2,c*s],[c*s,s**2]]) #Bottom right quadrant of del_Kg__del_area
-
-    return [K11, K12, K21,K22]
-
-def build_del_K__del_area(members, members_area, orientations, lengths, E):
-    n_DOF = calc_DOF(members)
-    Kp = np.zeros([n_DOF, n_DOF])  # Initialise the primary stiffness matrix
-    d_Kp__d_area = np.zeros((n_DOF, n_DOF,len(members)))
-    for dimension in range(len(members)):
-        for n, mbr in enumerate(members):
-            # note that enumerate adds a counter to an iterable (n)
-
-            # Calculate the quadrants of the global stiffness matrix for the member
-            theta = orientations[n]
-            L = lengths[n]
-            A = members_area[n]
-            if n == dimension:
-                [K11, K12, K21, K22] = calculate_del_Kg__del_area(theta, L, E, A)
-            else:
-                continue
-
-            node_i = mbr[0]  # Node number for node i of this member
-            node_j = mbr[1]  # Node number for node j of this member
-
-            # Primary stiffness matrix indices associated with each node
-
-            i = 2* node_i
-            j = 2 * node_j
-
-            d_Kp__d_area[i : i + 2, i : i + 2,dimension] = Kp[i : i + 2, i : i + 2] + K11
-            d_Kp__d_area[j : j + 2, j : j + 2,dimension] = Kp[j : j + 2, j : j + 2] + K22
-            d_Kp__d_area[i : i + 2, j : j + 2,dimension] = Kp[i : i + 2, j : j + 2] + K12
-            d_Kp__d_area[j : j + 2, i : i + 2,dimension] = Kp[j : j + 2, i : i + 2] + K21
-
-    return d_Kp__d_area
-
-def gradient(K,F,U,del_K__del_area,A,lengths,C,restrained_DOF):
-    K_reduced = build_matrix_reduced(K,restrained_DOF)
-    del_K_reduced__del_area = build_matrix_reduced(del_K__del_area,restrained_DOF)
-    F_reduced = build_matrix_reduced(F,restrained_DOF)
-    U_reduced = build_matrix_reduced(U,restrained_DOF)
-
-    lambda_ = np.linalg.solve(K_reduced.T,F_reduced.T) # solving adjoint equation
-    d_L__d_area = np.zeros((len(F),len(lengths))) # ( N, P)
-    temp = np.zeros((len(U_reduced),len(lengths)))
-    for i in range(len(lengths)):
-        temp[:,i] = del_K_reduced__del_area[:,:,i]@U_reduced # d_k/d_theta * U
-
-    d_L__d_area =  - lambda_.T @ temp # - lambda * d_k/d_theta * U
-    return d_L__d_area
+def gradient(def_members, lengths, E):
+    # Self-adjoint compliance shortcut.
+    # dK_e/dA_e = (E/L_e) b_e b_e^T with b_e^T u_e = axial elongation = strain·L_e,
+    # so dJ/dA_e = −(E/L_e)(b_e^T u_e)^2 = −E · L_e · strain_e^2.
+    return -E * lengths * def_members**2
 
 env = StructEnvironment()
 cost = []
@@ -154,14 +111,14 @@ members_area = np.ones_like(members_area) * env.A
 removed_indices = []
 i = 0
 while True:
-    F_members,def_members,UG,del_K__del_area,K = env.analyse(members_area) # del_K__del_area.shape = N*N*P
+    F_members,def_members,UG,K = env.analyse(members_area)
     new_cost = env.calculate_cost(UG)
     if (len(cost)>0) and (new_cost > 5*cost[i-1]):
         break
     cost.append(new_cost)
 
     env.render(members_area,F_members,UG)
-    gradient_area = gradient(K,env.point_loads,UG,del_K__del_area,members_area,env.lengths,env.total_area,env.restrained_DOF)
+    gradient_area = gradient(def_members, env.lengths, env.E)
     edges_sorted_by_importance = np.argsort(gradient_area)[::-1]
     j = 0
     while True:
