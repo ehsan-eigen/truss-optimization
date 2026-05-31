@@ -12,28 +12,36 @@ import math
 from utils import *
 
 OUTPUT_DIR = 'results'
+DEFAULT_DATASET = 'initial_structure'
+xFac = 1
 
 class StructEnvironment():
-    def __init__(self):
+    def __init__(self, dataset=DEFAULT_DATASET):
+        # `dataset` is a directory containing nodes.csv, members.csv,
+        # support.csv (restrained DOFs, 0-indexed) and loads.csv (sparse
+        # `dof,value` rows, 0-indexed).
 
         # Constants
         self.E = 200 * 10**6  # (N/m^2) Young's modulus
-        self.nodes = np.genfromtxt('initial_structure/nodes.csv',delimiter=',',dtype=np.float16)
         self.step_size = 0.01
         self.A = 0.01  # default size of element
 
-        # Supports
-        self.restrained_DOF = np.genfromtxt('initial_structure/support.csv',delimiter=',',dtype=np.int8)
+        self.nodes = np.genfromtxt(f'{dataset}/nodes.csv', delimiter=',', dtype=np.float64)
+        self.members = np.genfromtxt(f'{dataset}/members.csv', delimiter=',', dtype=np.int32)
+        self.restrained_DOF = np.atleast_1d(
+            np.genfromtxt(f'{dataset}/support.csv', delimiter=',', dtype=np.int32)
+        )
 
-        # Members
-        self.members = np.genfromtxt('initial_structure/members.csv',delimiter=',',dtype=np.int8)
         self.DOF = calc_DOF(self.members)
         self.element_count = len(self.members)
 
-        # Loading
-        self.point_loads = np.array([np.zeros(self.DOF)]).T.ravel()
-        self.point_loads[36] = -100*1e3
-        self.point_loads[37] = -100*1e3
+        # Loading: sparse `dof,value` rows
+        self.point_loads = np.zeros(self.DOF)
+        loads = np.atleast_2d(
+            np.genfromtxt(f'{dataset}/loads.csv', delimiter=',', dtype=np.float64)
+        )
+        for dof, value in loads:
+            self.point_loads[int(dof)] = value
 
         # Define any additional environment-specific variables here
         self.current_step = 0
@@ -84,7 +92,7 @@ class StructEnvironment():
         return cost,F_members,UG
 
     def render(self,members_area,F_members,UG,output_dir=OUTPUT_DIR):
-        plot_deflection(self.members, self.nodes,F_members, members_area,UG ,2,self.current_step,output_dir=output_dir)
+        plot_deflection(self.members, self.nodes,F_members, members_area,UG ,xFac,self.current_step,output_dir=output_dir)
 
 """# Adjoint Method ( Sensivity Analysis )
 
@@ -203,7 +211,9 @@ def oc_update(A, dJ_dA, lengths, V_target,
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-env = StructEnvironment()
+import sys
+dataset = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_DATASET
+env = StructEnvironment(dataset=dataset)
 cost = []
 members_area = np.ones(env.element_count) * env.A
 V_target = env.total_area
