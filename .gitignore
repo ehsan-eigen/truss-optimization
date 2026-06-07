@@ -1,0 +1,12 @@
+# Ignore everything
+*
+
+# Except Python source files, requirements, and project docs
+!*.py
+!requirements.txt
+!CLAUDE.md
+
+# Always ignore these even if re-included above
+__pycache__/
+*.pyc
+*.pyo
