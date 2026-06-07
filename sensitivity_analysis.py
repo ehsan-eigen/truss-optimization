@@ -351,6 +351,84 @@ def oc_update(A, dJ_dA, lengths, V_target,
     return A_new
 
 
+def run_sqp(env, members_area, C_max, max_iter=200, A_min=1e-4, A_max=None,
+            ftol=1e-9, output_dir=OUTPUT_DIR):
+    # Minimize weight Σ A_e L_e subject to:
+    #   compliance(A) ≤ C_max  (nonlinear inequality)
+    #   A_min ≤ A_e ≤ A_max   (bounds)
+    # Uses scipy's SLSQP with the analytical gradient already in this file.
+    #
+    # Scaling: work in x = A / A_ref (dimensionless), objective scaled by V0,
+    # constraint scaled by C_max. This brings all quantities to O(1), which is
+    # critical for SLSQP's QP subproblem — compliance (~10^6) vs area (~10^-2)
+    # causes very poor steps without scaling.
+    #
+    # A cache keyed on x.tobytes() avoids re-running FEM when scipy evaluates
+    # obj and jac at the same point (common during line search).
+    from scipy.optimize import minimize, Bounds
+
+    if A_max is None:
+        A_max = 100.0 * members_area.max()
+
+    A_ref = members_area.copy()
+    V0 = float(np.sum(A_ref * env.lengths))         # initial weight (= V_target for MMA start)
+
+    compliance_hist, volume_hist = [], []
+    _cache = {}
+
+    def _analyse(x):
+        A = x * A_ref
+        key = x.tobytes()
+        if key not in _cache:
+            _cache.clear()
+            F_members, def_members, UG, K = env.analyse(A)
+            compliance = env.calculate_cost(UG)
+            dC_dA = gradient(def_members, env.lengths, env.E)
+            _cache[key] = (compliance, dC_dA, F_members, UG, A)
+        return _cache[key]
+
+    # Objective: scaled weight  →  grad w.r.t. x_e = A_ref_e * L_e / V0
+    def obj(x):
+        A = x * A_ref
+        return float(np.sum(A * env.lengths)) / V0
+
+    def obj_jac(x):
+        return A_ref * env.lengths / V0
+
+    # Constraint: C_max - compliance(x) ≥ 0  (scipy 'ineq' convention)
+    # grad w.r.t. x_e = -dC/dA_e * A_ref_e / C_max
+    def con_fun(x):
+        compliance, *_ = _analyse(x)
+        return (C_max - compliance) / C_max
+
+    def con_jac(x):
+        _, dC_dA, *_ = _analyse(x)
+        return -dC_dA * A_ref / C_max
+
+    def callback(x):
+        compliance, _, F_members, UG, A = _analyse(x)
+        volume = float(np.sum(A * env.lengths))
+        feas = "feas" if compliance <= C_max else "INFEAS"
+        compliance_hist.append(compliance)
+        volume_hist.append(volume)
+        env.render(A, F_members, UG, output_dir=output_dir,
+                   compliance=compliance, volume=volume, algo='SQP')
+        print(f"[SQP] iter {len(compliance_hist):3d}  vol {volume:.4f}  "
+              f"compliance {compliance:.4f} (≤ {C_max:.4f}, {feas})")
+        env.current_step += 1
+
+    x0 = np.ones(len(members_area))
+    result = minimize(
+        obj, x0, method='SLSQP', jac=obj_jac,
+        bounds=Bounds(lb=A_min / A_ref, ub=A_max / A_ref),
+        constraints={'type': 'ineq', 'fun': con_fun, 'jac': con_jac},
+        callback=callback,
+        options={'maxiter': max_iter, 'ftol': ftol},
+    )
+    print(f"[SQP] {'converged' if result.success else 'stopped'}: {result.message}")
+    return result.x * A_ref, np.array(compliance_hist), np.array(volume_hist)
+
+
 def run_oc(env, members_area, max_iter=150, change_tol_factor=1e-3,
            output_dir=OUTPUT_DIR):
     V_target = env.total_area
@@ -447,14 +525,15 @@ if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset', default=DEFAULT_DATASET)
-    parser.add_argument('--algo', choices=['oc', 'mma'], default='oc',
-                        help='oc: compliance-min @ fixed volume; '
-                             'mma: weight-min subject to compliance ≤ C_max')
+    parser.add_argument('--algo', choices=['oc', 'mma', 'sqp'], default='oc',
+                        help='oc: compliance-min @ fixed volume (OC heuristic); '
+                             'mma: weight-min subject to compliance ≤ C_max; '
+                             'sqp: weight-min subject to compliance ≤ C_max (SLSQP)')
     parser.add_argument('--max-iter', type=int, default=200)
     parser.add_argument('--c-max', type=float, default=None,
-                        help='MMA only: absolute compliance bound')
+                        help='MMA/SQP: absolute compliance bound')
     parser.add_argument('--c-max-factor', type=float, default=1.5,
-                        help='MMA only: bound = factor × initial compliance '
+                        help='MMA/SQP: bound = factor × initial compliance '
                              '(used when --c-max not given)')
     args = parser.parse_args()
 
@@ -479,15 +558,22 @@ if __name__ == '__main__':
             F0, d0, UG0, _ = env.analyse(members_area)
             C0 = env.calculate_cost(UG0)
             C_max = args.c_max_factor * C0
-            print(f"[MMA] initial compliance = {C0:.4f}, "
+            print(f"[{args.algo.upper()}] initial compliance = {C0:.4f}, "
                   f"using C_max = {args.c_max_factor} × C0 = {C_max:.4f}")
         else:
             C_max = args.c_max
-        members_area, comp_hist, vol_hist = run_mma(env, members_area, C_max,
-                                                    max_iter=args.max_iter,
-                                                    output_dir=out_dir)
-        plot_history(comp_hist, vol_hist, 'MMA',
-                     f'{out_dir}/cost_vs_iteration.png', C_max=C_max)
+        if args.algo == 'sqp':
+            members_area, comp_hist, vol_hist = run_sqp(env, members_area, C_max,
+                                                        max_iter=args.max_iter,
+                                                        output_dir=out_dir)
+            plot_history(comp_hist, vol_hist, 'SQP',
+                         f'{out_dir}/cost_vs_iteration.png', C_max=C_max)
+        else:
+            members_area, comp_hist, vol_hist = run_mma(env, members_area, C_max,
+                                                        max_iter=args.max_iter,
+                                                        output_dir=out_dir)
+            plot_history(comp_hist, vol_hist, 'MMA',
+                         f'{out_dir}/cost_vs_iteration.png', C_max=C_max)
 
     build_gif(out_dir, os.path.join(out_dir, 'optimization.gif'))
 
