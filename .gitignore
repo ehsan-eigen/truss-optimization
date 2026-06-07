@@ -5,6 +5,7 @@
 !*.py
 !requirements.txt
 !CLAUDE.md
+!*.csv
 
 # Always ignore these even if re-included above
 __pycache__/
